@@ -1780,7 +1780,9 @@ def download_file_from_http_file(url, headers=None, usehttp=__use_http_lib__, ht
             httpfile.write(r.content)
         httpcodeout = r.status
         httpcodereason = http_status_to_reason(r.status)
-        httpversionout = r.http_version
+        httpversionout = r.extensions.get("http_version")
+        if isinstance(httpversionout, (bytes, bytearray)):
+            httpversionout = httpversionout.decode("ascii", errors="replace")
         httpmethodout = httpmethod
         httpurlout = str(rebuilt_url)
         httpheaderout = r.headers
