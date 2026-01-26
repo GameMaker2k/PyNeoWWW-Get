@@ -28,7 +28,7 @@ ROOT_SERVERS = [
     "202.12.27.33",   # m.root-servers.net
 ]
 
-QTYPE = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "MX": 15, "TXT": 16, "AAAA": 28}
+QTYPE = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "MX": 15, "TXT": 16, "AAAA": 28, "OPT": 41}
 QCLASS_IN = 1
 
 # -----------------------------
@@ -38,6 +38,12 @@ UPSTREAM_TIMEOUT = 2.0
 CACHE_TTL_CAP = 0          # 0 = no cap
 LOG_QUERIES = False
 BLOCKLIST = set()
+
+# EDNS/DNSSEC defaults (CLI)
+EDNS_SIZE_DEFAULT = 1232   # good modern UDP size; avoids fragmentation
+FORCE_DNSSEC_DO = False
+NO_EDNS = False
+
 
 # -----------------------------
 # Helpers for loading lists
@@ -147,16 +153,6 @@ def decode_name(msg, off):
     return ".".join(labels), (orig if jumped else off)
 
 
-def build_query(qname, qtype, rd=False):
-    tid = random.randint(0, 0xFFFF)
-    flags = 0x0000
-    if rd:
-        flags |= 0x0100  # RD
-    header = struct.pack("!HHHHHH", tid, flags, 1, 0, 0, 0)
-    q = encode_qname(qname) + struct.pack("!HH", qtype, QCLASS_IN)
-    return tid, header + q
-
-
 def parse_header(msg):
     if len(msg) < 12:
         raise ValueError("short header")
@@ -250,10 +246,6 @@ def _dnsname_norm(s):
 
 
 def _is_in_bailiwick(ns_host, zone):
-    """
-    ns_host is in-bailiwick if it is a subdomain of zone.
-    zone is the delegation name (owner name of NS RRset).
-    """
     ns_host = _dnsname_norm(ns_host)
     zone = _dnsname_norm(zone)
     if not ns_host or not zone:
@@ -262,13 +254,84 @@ def _is_in_bailiwick(ns_host, zone):
 
 
 # -----------------------------
+# EDNS0 (OPT) + DO bit
+# -----------------------------
+def _build_opt_rr(edns_size, do=False):
+    """
+    Build an OPT RR (RFC6891):
+      NAME=.
+      TYPE=41
+      CLASS=UDP payload size
+      TTL=ext_rcode(8) | version(8) | flags(16)  (DO bit is 0x8000 in flags)
+      RDLEN=0 (no options)
+    """
+    if not edns_size:
+        return b""
+    edns_size = int(edns_size)
+    if edns_size < 512:
+        edns_size = 512
+    if edns_size > 4096:
+        # you can raise this if you want, but 4096 is a reasonable cap for most networks
+        edns_size = 4096
+
+    name = b"\x00"
+    rtype = struct.pack("!H", QTYPE["OPT"])
+    rclass = struct.pack("!H", edns_size)
+    flags = 0x8000 if do else 0x0000
+    ttl = struct.pack("!I", flags)  # ext_rcode=0, ver=0, flags=flags
+    rdlen = struct.pack("!H", 0)
+    return name + rtype + rclass + ttl + rdlen
+
+
+def _client_edns_options(query_wire):
+    """
+    If client included OPT in Additional section, return (udp_size, do_bit).
+    Else (None, False).
+    """
+    try:
+        _tid, _flags, qd, an, ns, ar, _tc, _rcode = parse_header(query_wire)
+        off = 12
+        off = skip_questions(query_wire, off, qd)
+        # skip any answer/authority in query (normally 0)
+        for _ in range(an):
+            _, off = parse_rr(query_wire, off)
+        for _ in range(ns):
+            _, off = parse_rr(query_wire, off)
+        for _ in range(ar):
+            rr, off = parse_rr(query_wire, off)
+            if rr["type"] == QTYPE["OPT"]:
+                udp_size = rr["class"]          # for OPT, CLASS is udp payload size
+                do_bit = bool(rr["ttl"] & 0x8000)
+                return int(udp_size), do_bit
+    except Exception:
+        pass
+    return None, False
+
+
+def build_query(qname, qtype, rd=False, edns_size=None, do=False):
+    tid = random.randint(0, 0xFFFF)
+    flags = 0x0000
+    if rd:
+        flags |= 0x0100  # RD
+    qdcount = 1
+    ancount = 0
+    nscount = 0
+    arcount = 1 if edns_size else 0
+
+    header = struct.pack("!HHHHHH", tid, flags, qdcount, ancount, nscount, arcount)
+    q = encode_qname(qname) + struct.pack("!HH", qtype, QCLASS_IN)
+
+    if edns_size:
+        opt = _build_opt_rr(edns_size, do=do)
+        return tid, header + q + opt
+
+    return tid, header + q
+
+
+# -----------------------------
 # SOA parsing for negative caching TTL (RFC2308-ish)
 # -----------------------------
 def _soa_negative_ttl(resp_msg):
-    """
-    For NXDOMAIN or NODATA: use min(SOA RR TTL, SOA.MINIMUM).
-    Returns None if no SOA found.
-    """
     try:
         p = parse_sections(resp_msg)
     except Exception:
@@ -284,7 +347,6 @@ def _soa_negative_ttl(resp_msg):
             _, off = decode_name(raw, off)  # rname
             if off + 20 > len(raw):
                 return rr["ttl"]
-            # serial, refresh, retry, expire, minimum
             _serial, _refresh, _retry, _expire, minimum = struct.unpack("!IIIII", raw[off:off + 20])
             return max(1, min(int(rr["ttl"]), int(minimum)))
         except Exception:
@@ -311,7 +373,7 @@ def udp_exchange(server_ip, wire_query, timeout=2, port=53):
     s.settimeout(float(timeout))
     try:
         s.sendto(wire_query, (server_ip, int(port)))
-        data, _ = s.recvfrom(4096)
+        data, _ = s.recvfrom(65535)
         return data
     finally:
         s.close()
@@ -356,7 +418,7 @@ def exchange_with_tc_fallback(server_ip, wire_query, timeout=2, port=53):
 # -----------------------------
 # Iterative resolution (with bailiwick glue)
 # -----------------------------
-def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
+def iterative_resolve(qname, qtype, timeout=2, max_steps=25, edns_size=None, do=False):
     """
     Returns a DNS response message (bytes) from the last server contacted.
     Follows referrals iteratively from the root.
@@ -371,7 +433,7 @@ def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
 
         server = next_servers.pop(0)
 
-        _tid, wire = build_query(qname, qtype, rd=False)
+        _tid, wire = build_query(qname, qtype, rd=False, edns_size=edns_size, do=do)
         try:
             resp = exchange_with_tc_fallback(server, wire, timeout=timeout, port=53)
         except Exception:
@@ -396,7 +458,8 @@ def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
         glue_ips = []
         if bailiwick_zone:
             for rr in parsed["additional"]:
-                # Bailiwick check: glue owner (ns hostname) must be in-bailiwick of delegation zone
+                if rr["type"] not in (QTYPE["A"], QTYPE["AAAA"]):
+                    continue
                 if not _is_in_bailiwick(rr.get("name"), bailiwick_zone):
                     continue
                 ip = rr_ip_from_additional(rr)
@@ -416,7 +479,10 @@ def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
             for nsn in ns_names[:3]:
                 resolved_ns_ips = []
                 for qt in (QTYPE["AAAA"], QTYPE["A"]):
-                    ns_resp = iterative_resolve(nsn, qt, timeout=timeout, max_steps=max_steps)
+                    ns_resp = iterative_resolve(
+                        nsn, qt, timeout=timeout, max_steps=max_steps,
+                        edns_size=edns_size, do=do
+                    )
                     if not ns_resp:
                         continue
                     ns_parsed = parse_sections(ns_resp)
@@ -445,9 +511,6 @@ def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
 # CNAME chasing (build combined response)
 # -----------------------------
 def _response_question_wire(resp_msg):
-    """
-    Return the question section bytes (from offset 12 through end of questions).
-    """
     tid, flags, qd, an, ns, ar, tc, rcode = parse_header(resp_msg)
     off = 12
     off2 = skip_questions(resp_msg, off, qd)
@@ -455,12 +518,6 @@ def _response_question_wire(resp_msg):
 
 
 def _build_combined_response(original_resp, rr_wires_answer_list):
-    """
-    Build a response that reuses original header/question, but replaces:
-    - ANCOUNT with len(rr_wires_answer_list)
-    - NSCOUNT/ARCOUNT set to 0
-    - Answer section becomes concatenation of rr_wires_answer_list
-    """
     if len(original_resp) < 12:
         return original_resp
 
@@ -476,12 +533,8 @@ def _build_combined_response(original_resp, rr_wires_answer_list):
     return hdr + qwire + ans
 
 
-def resolve_with_cname_chase(qname, qtype, timeout, max_steps=25, max_cname=8):
-    """
-    Resolve qname/qtype. If response is CNAME-only for A/AAAA, chase and combine:
-    CNAME chain + final answers.
-    """
-    resp = iterative_resolve(qname, qtype, timeout=timeout, max_steps=max_steps)
+def resolve_with_cname_chase(qname, qtype, timeout, edns_size=None, do=False, max_steps=25, max_cname=8):
+    resp = iterative_resolve(qname, qtype, timeout=timeout, max_steps=max_steps, edns_size=edns_size, do=do)
     if not resp:
         return resp
 
@@ -495,41 +548,34 @@ def resolve_with_cname_chase(qname, qtype, timeout, max_steps=25, max_cname=8):
 
     for _ in range(max_cname):
         parsed = parse_sections(resp)
-        # If response already contains wanted type, we are done
         if any(rr["type"] == want for rr in parsed["answers"]):
             if chain:
                 combined = chain + [rr["wire"] for rr in parsed["answers"] if rr["type"] == want]
-                # Build combined response based on the *original* response for correct question, etc.
-                # Use first response's header/question, but replace answers.
                 base = chain_base_resp if "chain_base_resp" in locals() else resp
                 out = _build_combined_response(base, combined)
                 return out
             return resp
 
-        # Find a CNAME in answers
         cname_rr = None
         for rr in parsed["answers"]:
             if rr["type"] == QTYPE["CNAME"]:
                 cname_rr = rr
                 break
         if not cname_rr:
-            return resp  # no CNAME, just return as-is
+            return resp
 
-        # Decode CNAME target
         target, _ = decode_name(resp, cname_rr["rdata_off"])
         chain.append(cname_rr["wire"])
         if "chain_base_resp" not in locals():
-            chain_base_resp = resp  # remember first response as base
+            chain_base_resp = resp
 
         norm_t = _dnsname_norm(target)
         if norm_t in seen:
-            return resp  # loop
+            return resp
         seen.add(norm_t)
         current = target
 
-        # Resolve target for same qtype
-        resp = iterative_resolve(current, want, timeout=timeout, max_steps=max_steps)
-
+        resp = iterative_resolve(current, want, timeout=timeout, max_steps=max_steps, edns_size=edns_size, do=do)
         if not resp:
             return resp
 
@@ -606,13 +652,6 @@ def make_nxdomain(query_wire):
 
 
 def _rewrite_response_for_client(resp, client_tid_bytes, client_query_flags):
-    """
-    Rewrite upstream response to be suitable for a recursive resolver:
-    - TXID set to client TXID
-    - RA=1
-    - AA cleared
-    - RD copied from client
-    """
     if not resp or len(resp) < 12:
         return resp
 
@@ -646,11 +685,6 @@ def _apply_template(template_resp, client_tid_bytes, client_query_flags):
 
 
 def _negative_cache_ttl(resp):
-    """
-    For NXDOMAIN/NODATA:
-      ttl = SOA negative ttl if present, else 30.
-      apply CACHE_TTL_CAP if set.
-    """
     ttl = _soa_negative_ttl(resp)
     if ttl is None:
         ttl = 30
@@ -661,9 +695,6 @@ def _negative_cache_ttl(resp):
 
 
 def _is_nodata(resp):
-    """
-    NODATA heuristic: rcode=0, answers empty, and SOA present in authority.
-    """
     try:
         p = parse_sections(resp)
     except Exception:
@@ -672,7 +703,6 @@ def _is_nodata(resp):
         return False
     if p["answers"]:
         return False
-    # SOA in authority => NODATA (usually)
     return any(rr["type"] == QTYPE["SOA"] for rr in p["authority"])
 
 
@@ -682,9 +712,27 @@ def handle_query_wire(query_wire, client_addr=None):
     client_tid = query_wire[:2] if len(query_wire) >= 2 else b"\x00\x00"
     client_flags = struct.unpack("!H", query_wire[2:4])[0] if len(query_wire) >= 4 else 0
 
+    # Client EDNS options (if any)
+    client_edns_size, client_do = _client_edns_options(query_wire)
+
+    # Effective upstream EDNS/DO policy
+    eff_do = bool(client_do) or bool(FORCE_DNSSEC_DO)
+
+    if NO_EDNS:
+        # only honor client EDNS if they sent it
+        eff_edns = client_edns_size
+    else:
+        # prefer client size if present, else default
+        eff_edns = client_edns_size if client_edns_size else EDNS_SIZE_DEFAULT
+
+    # If nothing needs EDNS, disable OPT
+    if not eff_do and not client_edns_size and (NO_EDNS or not EDNS_SIZE_DEFAULT):
+        eff_edns = None
+
     if LOG_QUERIES:
         who = ("%s:%s" % client_addr) if client_addr else "-"
-        print("[DNS] from=%s qname=%s qtype=%d" % (who, qname, qtype))
+        print("[DNS] from=%s qname=%s qtype=%d edns=%s do=%s" %
+              (who, qname, qtype, str(eff_edns), "1" if eff_do else "0"))
 
     if is_blocked(qname):
         if LOG_QUERIES:
@@ -692,20 +740,24 @@ def handle_query_wire(query_wire, client_addr=None):
         resp = make_nxdomain(query_wire)
         return _rewrite_response_for_client(resp, client_tid, client_flags)
 
-    key = (_dnsname_norm(qname), qtype, qclass)
+    # Cache key must include DO flag (DNSSEC responses differ)
+    key = (_dnsname_norm(qname), qtype, qclass, 1 if eff_do else 0)
 
     cached_template = CACHE.get(key)
     if cached_template:
         return _apply_template(cached_template, client_tid, client_flags)
 
-    # Resolve (with CNAME chase for A/AAAA)
-    resp = resolve_with_cname_chase(qname, qtype, timeout=UPSTREAM_TIMEOUT)
+    resp = resolve_with_cname_chase(
+        qname, qtype,
+        timeout=UPSTREAM_TIMEOUT,
+        edns_size=eff_edns,
+        do=eff_do
+    )
 
     if not resp:
         resp = make_servfail(query_wire)
         return _rewrite_response_for_client(resp, client_tid, client_flags)
 
-    # Cache logic (positive + negative)
     try:
         p = parse_sections(resp)
         rcode = p["rcode"]
@@ -722,7 +774,6 @@ def handle_query_wire(query_wire, client_addr=None):
         CACHE.put(key, _template_response(resp), ttl=ttl)
         return _rewrite_response_for_client(resp, client_tid, client_flags)
 
-    # Positive cache
     ttl = min_ttl_from_answers(resp)
     if CACHE_TTL_CAP and CACHE_TTL_CAP > 0:
         ttl = min(ttl, int(CACHE_TTL_CAP))
@@ -752,7 +803,7 @@ def udp_server(bind_ip="127.0.0.1", port=5353):
     print("UDP DNS stub listening on %s:%d" % (bind_ip, port))
 
     while True:
-        data, addr = s.recvfrom(4096)
+        data, addr = s.recvfrom(65535)
         try:
             resp = handle_query_wire(data, client_addr=addr)
         except Exception:
@@ -824,7 +875,7 @@ def run_stub(bind_ip="127.0.0.1", port=5353):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Iterative DNS stub resolver: UDP+TCP, TXID rewrite, upstream TCP fallback on TC=1, IPv6, CNAME chase, negative cache, bailiwick glue"
+        description="Iterative DNS stub resolver: UDP+TCP, TXID rewrite, upstream TCP fallback on TC=1, IPv6, CNAME chase, negative cache, bailiwick glue, EDNS0+DO"
     )
 
     parser.add_argument("--bind", default="127.0.0.1",
@@ -847,6 +898,14 @@ if __name__ == "__main__":
     parser.add_argument("--roots", type=str, default=None,
                         help="Path to root server IP list (one IP per line)")
 
+    # EDNS/DNSSEC
+    parser.add_argument("--edns-size", type=int, default=EDNS_SIZE_DEFAULT,
+                        help="EDNS0 UDP payload size to advertise upstream (default: 1232). Set 0 to disable unless client uses EDNS.")
+    parser.add_argument("--no-edns", action="store_true",
+                        help="Do not add EDNS0 unless the client query already has OPT")
+    parser.add_argument("--dnssec", action="store_true",
+                        help="Force DNSSEC DO=1 upstream even if client didn't request it")
+
     args = parser.parse_args()
 
     UPSTREAM_TIMEOUT = float(args.upstream_timeout)
@@ -862,6 +921,10 @@ if __name__ == "__main__":
     if args.roots:
         ROOT_SERVERS = load_roots(args.roots)
 
+    EDNS_SIZE_DEFAULT = int(args.edns_size) if args.edns_size else 0
+    NO_EDNS = bool(args.no_edns)
+    FORCE_DNSSEC_DO = bool(args.dnssec)
+
     print("Starting DNS stub on %s:%d" % (args.bind, args.port))
     print("Upstream timeout: %.2fs" % UPSTREAM_TIMEOUT)
     if CACHE_TTL_CAP:
@@ -872,5 +935,8 @@ if __name__ == "__main__":
         print("Roots: %s (%d IPs)" % (args.roots, len(ROOT_SERVERS)))
     if LOG_QUERIES:
         print("Query logging: ON")
+    print("EDNS default size: %s" % (str(EDNS_SIZE_DEFAULT) if EDNS_SIZE_DEFAULT else "OFF"))
+    print("NO_EDNS: %s" % ("ON" if NO_EDNS else "OFF"))
+    print("Force DO (dnssec): %s" % ("ON" if FORCE_DNSSEC_DO else "OFF"))
 
     run_stub(args.bind, args.port)
