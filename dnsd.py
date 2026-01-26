@@ -9,15 +9,6 @@ import argparse
 import time
 import random
 
-try:
-    # Py3
-    from urllib.request import Request, urlopen
-    from urllib.parse import urlencode
-except ImportError:
-    # Py2
-    from urllib2 import Request, urlopen
-    from urllib import urlencode
-
 # -----------------------------
 # Root server IPs
 # -----------------------------
@@ -37,7 +28,7 @@ ROOT_SERVERS = [
     "202.12.27.33",   # m.root-servers.net
 ]
 
-QTYPE = {"A": 1, "NS": 2, "CNAME": 5, "MX": 15, "TXT": 16, "AAAA": 28}
+QTYPE = {"A": 1, "NS": 2, "CNAME": 5, "SOA": 6, "MX": 15, "TXT": 16, "AAAA": 28}
 QCLASS_IN = 1
 
 # -----------------------------
@@ -48,8 +39,10 @@ CACHE_TTL_CAP = 0          # 0 = no cap
 LOG_QUERIES = False
 BLOCKLIST = set()
 
+# -----------------------------
+# Helpers for loading lists
+# -----------------------------
 def load_roots(path):
-    """Load root server IPs from a file (one IP per line; # comments allowed)."""
     if not path:
         return ROOT_SERVERS
     try:
@@ -64,8 +57,8 @@ def load_roots(path):
     except Exception:
         return ROOT_SERVERS
 
+
 def load_blocklist(path):
-    """Load blocklist domains (one per line; # comments allowed)."""
     out = set()
     if not path:
         return out
@@ -82,8 +75,8 @@ def load_blocklist(path):
         pass
     return out
 
+
 def is_blocked(qname):
-    """Exact or suffix match against BLOCKLIST."""
     d = (qname or "").strip().lower().rstrip(".")
     if not d:
         return False
@@ -95,9 +88,14 @@ def is_blocked(qname):
             return True
     return False
 
+
+# -----------------------------
+# DNS wire helpers
+# -----------------------------
 def _byte_at(b, i):
     v = b[i]
     return v if isinstance(v, int) else ord(v)
+
 
 def encode_qname(name):
     name = name.strip().rstrip(".")
@@ -109,6 +107,7 @@ def encode_qname(name):
         out.append(struct.pack("!B", len(pb)) + pb)
     out.append(b"\x00")
     return b"".join(out)
+
 
 def decode_name(msg, off):
     labels = []
@@ -147,6 +146,7 @@ def decode_name(msg, off):
 
     return ".".join(labels), (orig if jumped else off)
 
+
 def build_query(qname, qtype, rd=False):
     tid = random.randint(0, 0xFFFF)
     flags = 0x0000
@@ -156,6 +156,7 @@ def build_query(qname, qtype, rd=False):
     q = encode_qname(qname) + struct.pack("!HH", qtype, QCLASS_IN)
     return tid, header + q
 
+
 def parse_header(msg):
     if len(msg) < 12:
         raise ValueError("short header")
@@ -163,6 +164,7 @@ def parse_header(msg):
     tc = bool(flags & 0x0200)
     rcode = flags & 0x000F
     return tid, flags, qd, an, ns, ar, tc, rcode
+
 
 def skip_questions(msg, off, qd):
     for _ in range(qd):
@@ -172,7 +174,9 @@ def skip_questions(msg, off, qd):
         off += 4
     return off
 
+
 def parse_rr(msg, off):
+    start = off
     name, off = decode_name(msg, off)
     if off + 10 > len(msg):
         raise ValueError("truncated rr header")
@@ -183,6 +187,7 @@ def parse_rr(msg, off):
         raise ValueError("truncated rdata")
     rdata = msg[off:off + rdlen]
     off += rdlen
+    wire = msg[start:off]
     return {
         "name": name,
         "type": rtype,
@@ -191,7 +196,9 @@ def parse_rr(msg, off):
         "rdlen": rdlen,
         "rdata": rdata,
         "rdata_off": rdata_off,
+        "wire": wire,
     }, off
+
 
 def parse_sections(msg):
     tid, flags, qd, an, ns, ar, tc, rcode = parse_header(msg)
@@ -216,6 +223,10 @@ def parse_sections(msg):
     return {
         "tid": tid,
         "flags": flags,
+        "qd": qd,
+        "an": an,
+        "ns": ns,
+        "ar": ar,
         "rcode": rcode,
         "tc": tc,
         "answers": answers,
@@ -224,6 +235,7 @@ def parse_sections(msg):
         "raw": msg,
     }
 
+
 def rr_ip_from_additional(rr):
     if rr["type"] == QTYPE["A"] and rr["rdlen"] == 4:
         b = bytearray(rr["rdata"])
@@ -231,6 +243,67 @@ def rr_ip_from_additional(rr):
     if rr["type"] == QTYPE["AAAA"] and rr["rdlen"] == 16:
         return socket.inet_ntop(socket.AF_INET6, rr["rdata"])
     return None
+
+
+def _dnsname_norm(s):
+    return (s or "").strip().lower().rstrip(".")
+
+
+def _is_in_bailiwick(ns_host, zone):
+    """
+    ns_host is in-bailiwick if it is a subdomain of zone.
+    zone is the delegation name (owner name of NS RRset).
+    """
+    ns_host = _dnsname_norm(ns_host)
+    zone = _dnsname_norm(zone)
+    if not ns_host or not zone:
+        return False
+    return ns_host == zone or ns_host.endswith("." + zone)
+
+
+# -----------------------------
+# SOA parsing for negative caching TTL (RFC2308-ish)
+# -----------------------------
+def _soa_negative_ttl(resp_msg):
+    """
+    For NXDOMAIN or NODATA: use min(SOA RR TTL, SOA.MINIMUM).
+    Returns None if no SOA found.
+    """
+    try:
+        p = parse_sections(resp_msg)
+    except Exception:
+        return None
+
+    raw = p["raw"]
+    for rr in p["authority"]:
+        if rr["type"] != QTYPE["SOA"]:
+            continue
+        try:
+            off = rr["rdata_off"]
+            _, off = decode_name(raw, off)  # mname
+            _, off = decode_name(raw, off)  # rname
+            if off + 20 > len(raw):
+                return rr["ttl"]
+            # serial, refresh, retry, expire, minimum
+            _serial, _refresh, _retry, _expire, minimum = struct.unpack("!IIIII", raw[off:off + 20])
+            return max(1, min(int(rr["ttl"]), int(minimum)))
+        except Exception:
+            return rr["ttl"]
+    return None
+
+
+# -----------------------------
+# Upstream transport (UDP + TCP fallback on TC=1)
+# -----------------------------
+def _recvn(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
 
 def udp_exchange(server_ip, wire_query, timeout=2, port=53):
     family = socket.AF_INET6 if ":" in server_ip else socket.AF_INET
@@ -243,6 +316,46 @@ def udp_exchange(server_ip, wire_query, timeout=2, port=53):
     finally:
         s.close()
 
+
+def tcp_exchange(server_ip, wire_query, timeout=2, port=53):
+    family = socket.AF_INET6 if ":" in server_ip else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_STREAM)
+    s.settimeout(float(timeout))
+    try:
+        s.connect((server_ip, int(port)))
+        s.sendall(struct.pack("!H", len(wire_query)) + wire_query)
+        hdr = _recvn(s, 2)
+        if not hdr:
+            raise RuntimeError("TCP DNS: missing length header")
+        (ln,) = struct.unpack("!H", hdr)
+        msg = _recvn(s, ln)
+        if not msg:
+            raise RuntimeError("TCP DNS: incomplete message")
+        return msg
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def exchange_with_tc_fallback(server_ip, wire_query, timeout=2, port=53):
+    resp = udp_exchange(server_ip, wire_query, timeout=timeout, port=port)
+    try:
+        _tid, _flags, _qd, _an, _ns, _ar, tc, _rcode = parse_header(resp)
+    except Exception:
+        return resp
+    if tc:
+        try:
+            return tcp_exchange(server_ip, wire_query, timeout=timeout, port=port)
+        except Exception:
+            return resp
+    return resp
+
+
+# -----------------------------
+# Iterative resolution (with bailiwick glue)
+# -----------------------------
 def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
     """
     Returns a DNS response message (bytes) from the last server contacted.
@@ -260,80 +373,176 @@ def iterative_resolve(qname, qtype, timeout=2, max_steps=25):
 
         _tid, wire = build_query(qname, qtype, rd=False)
         try:
-            resp = udp_exchange(server, wire, timeout=timeout)
+            resp = exchange_with_tc_fallback(server, wire, timeout=timeout, port=53)
         except Exception:
             continue
 
         last_msg = resp
         parsed = parse_sections(resp)
 
-        # If got answers, done (CNAME may be returned as-is)
+        # If got answers, done
         if parsed["answers"]:
             return resp
 
-        # Otherwise follow referral using NS in authority + glue in additional
+        # Referral: authority NS + additional glue
         ns_names = []
+        bailiwick_zone = None
         for rr in parsed["authority"]:
             if rr["type"] == QTYPE["NS"]:
+                bailiwick_zone = rr["name"]  # delegation zone
                 nsn, _ = decode_name(resp, rr["rdata_off"])
                 ns_names.append(nsn)
 
         glue_ips = []
-        for rr in parsed["additional"]:
-            ip = rr_ip_from_additional(rr)
-            if ip:
-                glue_ips.append(ip)
+        if bailiwick_zone:
+            for rr in parsed["additional"]:
+                # Bailiwick check: glue owner (ns hostname) must be in-bailiwick of delegation zone
+                if not _is_in_bailiwick(rr.get("name"), bailiwick_zone):
+                    continue
+                ip = rr_ip_from_additional(rr)
+                if ip:
+                    glue_ips.append(ip)
 
         if glue_ips:
             random.shuffle(glue_ips)
             next_servers = glue_ips + next_servers
             continue
 
-        # No glue: resolve NS name (try AAAA first, then A)
+        # No usable glue: resolve NS hostnames (AAAA first, then A)
         if ns_names:
             random.shuffle(ns_names)
             resolved_ns_ips = []
 
             for nsn in ns_names[:3]:
                 resolved_ns_ips = []
-
                 for qt in (QTYPE["AAAA"], QTYPE["A"]):
                     ns_resp = iterative_resolve(nsn, qt, timeout=timeout, max_steps=max_steps)
                     if not ns_resp:
                         continue
-
                     ns_parsed = parse_sections(ns_resp)
-
                     for rr in ns_parsed["answers"]:
                         if rr["type"] == QTYPE["A"] and rr["rdlen"] == 4:
                             b = bytearray(rr["rdata"])
                             resolved_ns_ips.append("%d.%d.%d.%d" % (b[0], b[1], b[2], b[3]))
                         elif rr["type"] == QTYPE["AAAA"] and rr["rdlen"] == 16:
                             resolved_ns_ips.append(socket.inet_ntop(socket.AF_INET6, rr["rdata"]))
-
                     if resolved_ns_ips:
-                        break  # prefer AAAA if it worked
-
+                        break
                 if resolved_ns_ips:
-                    break  # first NS name that yields IPs
+                    break
 
             if resolved_ns_ips:
                 random.shuffle(resolved_ns_ips)
                 next_servers = resolved_ns_ips + next_servers
                 continue
 
-        # Cannot progress further; return last
         return resp
 
     return last_msg
 
+
 # -----------------------------
-# Simple cache (positive only)
+# CNAME chasing (build combined response)
+# -----------------------------
+def _response_question_wire(resp_msg):
+    """
+    Return the question section bytes (from offset 12 through end of questions).
+    """
+    tid, flags, qd, an, ns, ar, tc, rcode = parse_header(resp_msg)
+    off = 12
+    off2 = skip_questions(resp_msg, off, qd)
+    return resp_msg[12:off2]
+
+
+def _build_combined_response(original_resp, rr_wires_answer_list):
+    """
+    Build a response that reuses original header/question, but replaces:
+    - ANCOUNT with len(rr_wires_answer_list)
+    - NSCOUNT/ARCOUNT set to 0
+    - Answer section becomes concatenation of rr_wires_answer_list
+    """
+    if len(original_resp) < 12:
+        return original_resp
+
+    tid, flags, qd, an, ns, ar, tc, rcode = parse_header(original_resp)
+    qwire = _response_question_wire(original_resp)
+
+    new_an = len(rr_wires_answer_list)
+    new_ns = 0
+    new_ar = 0
+
+    hdr = struct.pack("!HHHHHH", tid, flags, qd, new_an, new_ns, new_ar)
+    ans = b"".join(rr_wires_answer_list)
+    return hdr + qwire + ans
+
+
+def resolve_with_cname_chase(qname, qtype, timeout, max_steps=25, max_cname=8):
+    """
+    Resolve qname/qtype. If response is CNAME-only for A/AAAA, chase and combine:
+    CNAME chain + final answers.
+    """
+    resp = iterative_resolve(qname, qtype, timeout=timeout, max_steps=max_steps)
+    if not resp:
+        return resp
+
+    want = qtype
+    if want not in (QTYPE["A"], QTYPE["AAAA"]):
+        return resp
+
+    chain = []
+    current = qname
+    seen = set([_dnsname_norm(current)])
+
+    for _ in range(max_cname):
+        parsed = parse_sections(resp)
+        # If response already contains wanted type, we are done
+        if any(rr["type"] == want for rr in parsed["answers"]):
+            if chain:
+                combined = chain + [rr["wire"] for rr in parsed["answers"] if rr["type"] == want]
+                # Build combined response based on the *original* response for correct question, etc.
+                # Use first response's header/question, but replace answers.
+                base = chain_base_resp if "chain_base_resp" in locals() else resp
+                out = _build_combined_response(base, combined)
+                return out
+            return resp
+
+        # Find a CNAME in answers
+        cname_rr = None
+        for rr in parsed["answers"]:
+            if rr["type"] == QTYPE["CNAME"]:
+                cname_rr = rr
+                break
+        if not cname_rr:
+            return resp  # no CNAME, just return as-is
+
+        # Decode CNAME target
+        target, _ = decode_name(resp, cname_rr["rdata_off"])
+        chain.append(cname_rr["wire"])
+        if "chain_base_resp" not in locals():
+            chain_base_resp = resp  # remember first response as base
+
+        norm_t = _dnsname_norm(target)
+        if norm_t in seen:
+            return resp  # loop
+        seen.add(norm_t)
+        current = target
+
+        # Resolve target for same qtype
+        resp = iterative_resolve(current, want, timeout=timeout, max_steps=max_steps)
+
+        if not resp:
+            return resp
+
+    return resp
+
+
+# -----------------------------
+# Cache (template responses: TXID rewritten per request)
 # -----------------------------
 class Cache(object):
     def __init__(self):
         self._lock = threading.Lock()
-        self._store = {}  # key -> (expires_at, wire_response)
+        self._store = {}  # key -> (expires_at, wire_response_template)
 
     def get(self, key):
         now = time.time()
@@ -352,13 +561,14 @@ class Cache(object):
         with self._lock:
             self._store[key] = (exp, msg)
 
+
 CACHE = Cache()
 
+
 # -----------------------------
-# Stub resolver server (UDP + TCP)
+# Server response helpers
 # -----------------------------
 def extract_question(msg):
-    # returns (qname, qtype, qclass)
     _tid, _flags, qd, _an, _ns, _ar, _tc, _rcode = parse_header(msg)
     if qd < 1:
         raise ValueError("no question")
@@ -369,6 +579,7 @@ def extract_question(msg):
     qtype, qclass = struct.unpack("!HH", msg[off:off + 4])
     return qname, qtype, qclass
 
+
 def min_ttl_from_answers(resp_msg):
     try:
         p = parse_sections(resp_msg)
@@ -377,49 +588,99 @@ def min_ttl_from_answers(resp_msg):
     except Exception:
         return 30
 
+
 def make_servfail(query_wire):
-    # Minimal SERVFAIL response echoing question section
     if len(query_wire) < 12:
         return b"\x00\x00" + struct.pack("!H", 0x8002) + b"\x00\x01\x00\x00\x00\x00\x00\x00"
     tid = query_wire[:2]
     hdr = tid + struct.pack("!H", 0x8002) + struct.pack("!HHHH", 1, 0, 0, 0)
     return hdr + query_wire[12:]
 
+
 def make_nxdomain(query_wire):
-    # Minimal NXDOMAIN response echoing question section
     if len(query_wire) < 12:
         return b"\x00\x00" + struct.pack("!H", 0x8003) + b"\x00\x01\x00\x00\x00\x00\x00\x00"
     tid = query_wire[:2]
     hdr = tid + struct.pack("!H", 0x8003) + struct.pack("!HHHH", 1, 0, 0, 0)
     return hdr + query_wire[12:]
 
-def rewrite_id_and_flags(resp_wire, client_tid_bytes, client_query_wire):
+
+def _rewrite_response_for_client(resp, client_tid_bytes, client_query_flags):
     """
-    Make the response acceptable to clients like dig:
-      - overwrite TXID with client's TXID
-      - ensure QR=1
-      - if client set RD, set RA=1 (we do iterative recursion ourselves)
+    Rewrite upstream response to be suitable for a recursive resolver:
+    - TXID set to client TXID
+    - RA=1
+    - AA cleared
+    - RD copied from client
     """
-    if not resp_wire or len(resp_wire) < 12:
-        return resp_wire
+    if not resp or len(resp) < 12:
+        return resp
 
-    out = bytearray(resp_wire)
-    out[0:2] = client_tid_bytes
+    client_rd = bool(client_query_flags & 0x0100)
 
-    flags = struct.unpack("!H", out[2:4])[0]
-    flags |= 0x8000  # QR=1
+    _up_tid, up_flags, qd, an, ns, ar = struct.unpack("!HHHHHH", resp[:12])
 
-    if client_query_wire and len(client_query_wire) >= 4:
-        qflags = struct.unpack("!H", client_query_wire[2:4])[0]
-        if qflags & 0x0100:     # RD
-            flags |= 0x0080     # RA
+    up_flags |= 0x8000      # QR=1
+    up_flags &= ~0x0400     # AA=0
+    up_flags |= 0x0080      # RA=1
 
-    out[2:4] = struct.pack("!H", flags)
-    return bytes(out)
+    if client_rd:
+        up_flags |= 0x0100
+    else:
+        up_flags &= ~0x0100
+
+    new_hdr = client_tid_bytes + struct.pack("!H", up_flags) + struct.pack("!HHHH", qd, an, ns, ar)
+    return new_hdr + resp[12:]
+
+
+def _template_response(resp):
+    if not resp or len(resp) < 2:
+        return resp
+    return b"\x00\x00" + resp[2:]
+
+
+def _apply_template(template_resp, client_tid_bytes, client_query_flags):
+    if not template_resp:
+        return template_resp
+    return _rewrite_response_for_client(template_resp, client_tid_bytes, client_query_flags)
+
+
+def _negative_cache_ttl(resp):
+    """
+    For NXDOMAIN/NODATA:
+      ttl = SOA negative ttl if present, else 30.
+      apply CACHE_TTL_CAP if set.
+    """
+    ttl = _soa_negative_ttl(resp)
+    if ttl is None:
+        ttl = 30
+    ttl = max(1, int(ttl))
+    if CACHE_TTL_CAP and CACHE_TTL_CAP > 0:
+        ttl = min(ttl, int(CACHE_TTL_CAP))
+    return ttl
+
+
+def _is_nodata(resp):
+    """
+    NODATA heuristic: rcode=0, answers empty, and SOA present in authority.
+    """
+    try:
+        p = parse_sections(resp)
+    except Exception:
+        return False
+    if p["rcode"] != 0:
+        return False
+    if p["answers"]:
+        return False
+    # SOA in authority => NODATA (usually)
+    return any(rr["type"] == QTYPE["SOA"] for rr in p["authority"])
+
 
 def handle_query_wire(query_wire, client_addr=None):
-    client_tid = query_wire[:2]
     qname, qtype, qclass = extract_question(query_wire)
+
+    client_tid = query_wire[:2] if len(query_wire) >= 2 else b"\x00\x00"
+    client_flags = struct.unpack("!H", query_wire[2:4])[0] if len(query_wire) >= 4 else 0
 
     if LOG_QUERIES:
         who = ("%s:%s" % client_addr) if client_addr else "-"
@@ -428,34 +689,59 @@ def handle_query_wire(query_wire, client_addr=None):
     if is_blocked(qname):
         if LOG_QUERIES:
             print("[DNS] BLOCKED %s" % qname)
-        # make_nxdomain already echoes client tid, but also force QR/RA
-        return rewrite_id_and_flags(make_nxdomain(query_wire), client_tid, query_wire)
+        resp = make_nxdomain(query_wire)
+        return _rewrite_response_for_client(resp, client_tid, client_flags)
 
-    key = (qname.lower(), qtype, qclass)
+    key = (_dnsname_norm(qname), qtype, qclass)
 
-    cached = CACHE.get(key)
-    if cached:
-        return rewrite_id_and_flags(cached, client_tid, query_wire)
+    cached_template = CACHE.get(key)
+    if cached_template:
+        return _apply_template(cached_template, client_tid, client_flags)
 
-    resp = iterative_resolve(qname, qtype, timeout=UPSTREAM_TIMEOUT)
+    # Resolve (with CNAME chase for A/AAAA)
+    resp = resolve_with_cname_chase(qname, qtype, timeout=UPSTREAM_TIMEOUT)
+
     if not resp:
-        return rewrite_id_and_flags(make_servfail(query_wire), client_tid, query_wire)
+        resp = make_servfail(query_wire)
+        return _rewrite_response_for_client(resp, client_tid, client_flags)
 
+    # Cache logic (positive + negative)
+    try:
+        p = parse_sections(resp)
+        rcode = p["rcode"]
+    except Exception:
+        rcode = 0
+
+    if rcode == 3:  # NXDOMAIN
+        ttl = _negative_cache_ttl(resp)
+        CACHE.put(key, _template_response(resp), ttl=ttl)
+        return _rewrite_response_for_client(resp, client_tid, client_flags)
+
+    if _is_nodata(resp):
+        ttl = _negative_cache_ttl(resp)
+        CACHE.put(key, _template_response(resp), ttl=ttl)
+        return _rewrite_response_for_client(resp, client_tid, client_flags)
+
+    # Positive cache
     ttl = min_ttl_from_answers(resp)
     if CACHE_TTL_CAP and CACHE_TTL_CAP > 0:
         ttl = min(ttl, int(CACHE_TTL_CAP))
 
-    CACHE.put(key, resp, ttl=ttl)
-    return rewrite_id_and_flags(resp, client_tid, query_wire)
+    CACHE.put(key, _template_response(resp), ttl=ttl)
+    return _rewrite_response_for_client(resp, client_tid, client_flags)
 
+
+# -----------------------------
+# UDP + TCP servers (IPv4/IPv6 bind)
+# -----------------------------
 def _bind_family(bind_ip):
     return socket.AF_INET6 if ":" in bind_ip else socket.AF_INET
+
 
 def udp_server(bind_ip="127.0.0.1", port=5353):
     fam = _bind_family(bind_ip)
     s = socket.socket(fam, socket.SOCK_DGRAM)
 
-    # Optional dual-stack (may be ignored on Android)
     if fam == socket.AF_INET6:
         try:
             s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -464,21 +750,21 @@ def udp_server(bind_ip="127.0.0.1", port=5353):
 
     s.bind((bind_ip, port))
     print("UDP DNS stub listening on %s:%d" % (bind_ip, port))
+
     while True:
         data, addr = s.recvfrom(4096)
         try:
             resp = handle_query_wire(data, client_addr=addr)
         except Exception:
             resp = make_servfail(data)
-            resp = rewrite_id_and_flags(resp, data[:2] if len(data) >= 2 else b"\x00\x00", data)
         s.sendto(resp, addr)
+
 
 def tcp_server(bind_ip="127.0.0.1", port=5353):
     fam = _bind_family(bind_ip)
     ss = socket.socket(fam, socket.SOCK_STREAM)
     ss.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    # Optional dual-stack (may be ignored on Android)
     if fam == socket.AF_INET6:
         try:
             ss.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
@@ -488,11 +774,13 @@ def tcp_server(bind_ip="127.0.0.1", port=5353):
     ss.bind((bind_ip, port))
     ss.listen(50)
     print("TCP DNS stub listening on %s:%d" % (bind_ip, port))
+
     while True:
         conn, _addr = ss.accept()
         threading.Thread(target=_tcp_client, args=(conn,), daemon=True).start()
 
-def _recvn(conn, n):
+
+def _recvn_conn(conn, n):
     data = b""
     while len(data) < n:
         chunk = conn.recv(n - len(data))
@@ -501,26 +789,27 @@ def _recvn(conn, n):
         data += chunk
     return data
 
+
 def _tcp_client(conn):
     try:
-        hdr = _recvn(conn, 2)
+        hdr = _recvn_conn(conn, 2)
         if not hdr:
             return
         (ln,) = struct.unpack("!H", hdr)
-        q = _recvn(conn, ln)
+        q = _recvn_conn(conn, ln)
         if not q:
             return
         try:
             resp = handle_query_wire(q)
         except Exception:
             resp = make_servfail(q)
-            resp = rewrite_id_and_flags(resp, q[:2] if len(q) >= 2 else b"\x00\x00", q)
         conn.sendall(struct.pack("!H", len(resp)) + resp)
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
 
 def run_stub(bind_ip="127.0.0.1", port=5353):
     t1 = threading.Thread(target=udp_server, args=(bind_ip, port))
@@ -532,28 +821,25 @@ def run_stub(bind_ip="127.0.0.1", port=5353):
     while True:
         time.sleep(3600)
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Simple iterative DNS stub resolver (UDP + TCP)"
+        description="Iterative DNS stub resolver: UDP+TCP, TXID rewrite, upstream TCP fallback on TC=1, IPv6, CNAME chase, negative cache, bailiwick glue"
     )
 
-    # Listener
     parser.add_argument("--bind", default="127.0.0.1",
                         help="IP address to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5353,
                         help="Port to listen on (default: 5353)")
 
-    # Upstream
     parser.add_argument("--upstream-timeout", type=float, default=2.0,
                         help="Timeout (seconds) per upstream hop (default: 2.0)")
     parser.add_argument("--timeout", type=float, default=None,
                         help="Alias for --upstream-timeout")
 
-    # Cache control
     parser.add_argument("--cache-ttl-cap", type=int, default=0,
                         help="Max TTL to cache in seconds; 0=no cap (default: 0)")
 
-    # Features
     parser.add_argument("--log-queries", action="store_true",
                         help="Log queries to stdout")
     parser.add_argument("--blocklist", type=str, default=None,
@@ -563,7 +849,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Apply runtime config (top-level assignments; no 'global' needed)
     UPSTREAM_TIMEOUT = float(args.upstream_timeout)
     if args.timeout is not None:
         UPSTREAM_TIMEOUT = float(args.timeout)
