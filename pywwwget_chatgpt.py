@@ -61,6 +61,7 @@ import io
 import re
 import sys
 import json
+import getpass
 import random
 import platform
 import socket
@@ -2468,7 +2469,7 @@ def download_file_from_http_file(url, headers=None, usehttp=__use_http_lib__, us
         if(isinstance(headers, list)):
             headers = make_http_headers_from_list_to_dict(headers)
     if(httpcookie is None):
-        httpcookie = tempfile.mktemp(suffix=".txt")
+        httpcookie = hashlib.sha1(getpass.getuser().encode("UTF-8")).hexdigest()+".txt"
     cookie_name, cookie_ext = os.path.splitext(httpcookie)
     cookiefile = httpcookie
     if(usehttp!="pycurl" or not havepycurl):
