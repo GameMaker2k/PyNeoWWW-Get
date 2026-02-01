@@ -20,7 +20,6 @@ Word separation:
 """
 
 from __future__ import print_function
-import pywwwget_nextver as pywwwget
 import io
 
 STX = b"\x02"
